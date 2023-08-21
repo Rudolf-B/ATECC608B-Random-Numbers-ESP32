@@ -1,0 +1,787 @@
+/*
+  This program demonstrates the use of a grid of MAX7219 LED displays (7 segments)controlled
+  by an ESP32 microcontroller. It generates and displays true random numbers (TRNG)
+  on the grid using the ATECC608B crypto-authentication chip as a hardware random number
+  generator. The program can be configured to fill up the grid in rows and columns
+  or to update random positions in the grid with new random numbers.
+
+  The ATECC608B is a secure element that provides hardware-based true random number
+  generation, cryptographic key generation and storage, and authentication features.
+  In this code, we use the ATECC608B's random number generation capability to create
+  truly random numbers for display on the LED grid.
+
+  Rejection sampling is implemented in the generateRandomNumberInRange() function
+  to ensure that the generated random numbers are uniformly distributed within the
+  specified range (min, max). Rejection sampling is a technique used to transform
+  a non-uniform distribution of random numbers into a uniform one, improving the
+  quality and fairness of the random numbers used in this program.
+
+  To use this code, connect the MAX7219 LED displays to the specified pins on the
+  ESP32 and connect the ATECC608B as described in the device's documentation.
+  The display will initially fill up with random numbers, and then continuously update
+  random positions in the grid with new random numbers, depending on the configuration
+  set by the fillColumnsRowsFirst variable.
+  All the numbers you see are True Random, except for the scramble animation function, this is only for the animation and are not readable anyways.
+  Enjoy the pure random number generator super computer!
+  **********************https://www.youtube.com/@Rudolf-B**********************
+*/
+
+#include <Wire.h>
+#include <LedControl.h>
+#include <TRNG.h>
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+
+const char* ssid     = "KPNED2D06";
+const char* password = "vNWHfHZxZ6JkTWTb";
+
+// Create an instance of the server
+// specify the port to listen on as an argument
+AsyncWebServer server(80);
+
+
+TRNG trng; // Create an instance of the TRNG class
+
+// Pins for the MAX7219: DIN, CLK, LOAD/CS
+const int DIN_PIN = 13;
+const int CLK_PIN = 12;
+const int LOAD_PIN = 15;
+
+// The number of MAX7219 chips
+const int NUM_MAX7219 = 6;
+
+// Number of rows and columns in the grid
+const int ROWS = 6;
+const int COLS = 8;
+int display[48];
+
+int delayFill = 0;
+int delayUpdate = 0;
+int prog = 1;
+
+char currentNumbers[ROWS][COLS] = {0};
+int overallBrightness = 10; // 1-15
+
+const byte numScramble = 6;
+int delayBetweenScrambles = 10;
+byte duplicates[numScramble] = {10, 10, 10, 10, 10, 10};
+
+bool fillGridAtStart = true;
+bool filledPositions[ROWS][COLS] = {false};
+int filledCount = 0;
+
+LedControl lc = LedControl(DIN_PIN, CLK_PIN, LOAD_PIN, NUM_MAX7219);
+
+void setup() {
+
+  Serial.begin(115200);
+  delay(350);
+
+  // Initialize the MAX7219 chips
+  for (int i = 0; i < NUM_MAX7219; i++) {
+    lc.shutdown(i, false);
+    lc.setIntensity(i, overallBrightness);
+    lc.clearDisplay(i);
+  }
+
+  // Connect to Wi-Fi
+  WiFi.begin(ssid, password);
+  //  while (WiFi.status() != WL_CONNECTED) {
+  //    delay(1000);
+  //    Serial.println("Connecting to WiFi...");
+  //  }
+  Serial.println(WiFi.localIP());
+
+  // Route for root / web page
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest * request) {
+    String html = "<!DOCTYPE html>"
+                  "<html>"
+                  "<head>"
+                  "<style>"
+                  "body { background-color: black; color: yellow; font-size: 22px; font-family: Arial, sans-serif; text-align: center; padding-top: 50px;}"
+                  "h1 { font-size: 30px; margin-bottom: 50px;}"
+                  "h2 { text-decoration: underline;}"
+                  "input[type=number] { font-size: 20px; width: 60px;}"
+                  "input[type=submit] { font-size: 20px; margin-top: 20px; background-color: yellow; color: black; border: none; padding: 10px 20px; cursor: pointer;}"
+                  "</style>"
+                  "<script>"
+                  "function submitForm() {"
+                  "  var brightness = document.getElementById('brightness').value;"
+                  "  var xhr = new XMLHttpRequest();"
+                  "  xhr.open('GET', '/brightness?value=' + brightness, true);"
+                  "  xhr.send();"
+                  "  xhr.onload = function () {"
+                  "    if (xhr.status == 200) {"
+                  "      alert(xhr.responseText);"
+                  "      location.reload();"
+                  "    }"
+                  "  };"
+                  "  return false;" // Prevent form from submitting normally
+                  "}"
+                  "</script>"
+                  "</head>"
+                  "<body>"
+                  "<h1>Rudolfs Super Random Number Generator</h1>"
+                  "<h2>Brightness control</h2>"
+                  "<p>Current brightness: " + String(overallBrightness) + "</p>"
+                  "<form onsubmit=\"return submitForm()\">"
+                  "<label for=\"brightness\">Brightness:</label><br>"
+                  "<input type=\"number\" id=\"brightness\" name=\"value\" min=\"1\" max=\"15\"><br>"
+                  "<input type=\"submit\" value=\"Submit\">"
+                  "</form>"
+                  "</body>"
+                  "</html>";
+    request->send(200, "text/html", html);
+  });
+
+  // Send a GET request to <ESP_IP>/brightness?value=<BRIGHTNESS_VALUE>
+  server.on("/brightness", HTTP_GET, [] (AsyncWebServerRequest * request) {
+    String message;
+    if (request->hasParam("value")) {
+      message = request->getParam("value")->value();
+      overallBrightness = message.toInt(); // Change the brightness here
+
+      // Ensure the new brightness value is applied to all MAX7219 chips
+      for (int i = 0; i < NUM_MAX7219; i++) {
+        lc.setIntensity(i, overallBrightness);
+      }
+
+    } else {
+      message = "No message sent";
+    }
+    request->send(200, "text/plain", "Brightness set to: " + String(overallBrightness) + ". Page will reload in a moment...");
+  });
+
+  // Start the server
+  server.begin();
+
+  delay(500);
+  waveAnimation();
+  makeReadyForNext();
+  for (int i = 0; i < 6; i++) {
+    animateAllDigitsC();
+  }
+  makeReadyForNext();
+  fillWithRandomBin();
+}
+
+void loop() {
+  //fillWithRandomNumbers();
+  
+  //int prog = trng.getRandomInRange(0, 9);
+
+  switch (prog) {
+    case 0:
+      // no extra function call needed here
+      break;
+    case 1:
+      scrollEffect(70, 0);
+      break;
+    case 2:
+      waveEffectFillIn();
+      break;
+    case 3:
+      fillSpiral();
+      break;
+    case 4:
+      fillScreenMultipleTimes();
+      break;
+    case 5:
+    //(int blinkCount, int blinkDelay) 
+      blinkRandomDigits(35, 25);
+      break;
+    case 6:
+      waveEffect();
+      break;
+    case 7:
+      fillAnimation();
+      break;
+    case 8:
+      fillWithRandomBin();
+      break;
+    case 9:
+      fillOneByOne();
+      break;
+    default:
+      // default case if none of the above cases match
+      break;
+  }
+  prog++;
+if (prog > 9){
+  prog = 1;
+}
+  // This line is common to all, so moved outside the switch block
+  //updateWithRandomNumbers();
+}
+
+void fillWithRandomNumbers() {
+  delayBetweenScrambles = 0;
+  // Continue to fill the grid until it is completely full
+  while (filledCount < ROWS * COLS) {
+    // Continuously update a random place in the grid with a new random number
+    int randomRow = trng.getRandomInRange(0, ROWS - 1);
+    int randomCol = trng.getRandomInRange(0, COLS - 1);
+
+    // Call the Scramble function for the selected row and column
+    scramble(randomRow, randomCol);
+
+    int randomNum = trng.getRandomInRange(0, 9);
+    lc.setDigit(randomRow, randomCol, randomNum, false);
+    currentNumbers[randomRow][randomCol] = randomNum;
+
+    delay(delayUpdate);
+
+    // Update the filledPositions array and increment the filledCount if necessary
+    if (!filledPositions[randomRow][randomCol]) {
+      filledPositions[randomRow][randomCol] = true;
+      filledCount++;
+    }
+  }
+
+  delay(250); // Add a delay before clearing the grid (optional)
+
+  // Reset the filledPositions array and filledCount
+  for (int row = 0; row < ROWS; row++) {
+    for (int col = 0; col < COLS; col++) {
+      filledPositions[row][col] = false;
+    }
+  }
+
+  filledCount = 0; // Reset the filledCount
+  makeReadyForNext();
+}
+
+void fillWithRandomBin() {
+  delayBetweenScrambles = 0;
+  // Continue to fill the grid until it is completely full
+  while (filledCount < ROWS * COLS) {
+    // Continuously update a random place in the grid with a new random number
+    int randomRow = trng.getRandomInRange(0, ROWS - 1);
+    int randomCol = trng.getRandomInRange(0, COLS - 1);
+
+    int randomNum = trng.getRandomInRange(0, 1);
+    lc.setDigit(randomRow, randomCol, randomNum, false);
+    currentNumbers[randomRow][randomCol] = randomNum;
+
+    delay(5);
+
+    // Update the filledPositions array and increment the filledCount if necessary
+    if (!filledPositions[randomRow][randomCol]) {
+      filledPositions[randomRow][randomCol] = true;
+      filledCount++;
+    }
+  }
+
+  delay(250); // Add a delay before clearing the grid (optional)
+
+  // Reset the filledPositions array and filledCount
+  for (int row = 0; row < ROWS; row++) {
+    for (int col = 0; col < COLS; col++) {
+      filledPositions[row][col] = false;
+    }
+  }
+
+  filledCount = 0; // Reset the filledCount
+  makeReadyForNext();
+}
+
+void updateWithRandomNumbers() {
+  delayBetweenScrambles = 30;
+  int updatesCount = 0;
+  while (updatesCount < 1250) {// on average you will need 216 tries before all the digits are turned on.
+    int randomRow = trng.getRandomInRange(0, ROWS - 1);
+    int randomCol = trng.getRandomInRange(0, COLS - 1);
+    lc.setChar(randomRow, randomCol, ' ', false);
+    delay(75);
+
+
+    int randomNum = trng.getRandomInRange(0, 9);
+    animateDigit(randomRow, randomCol); // Add animation here
+    animateDigit(randomRow, randomCol); // Add animation here
+    lc.setDigit(randomRow, randomCol, randomNum, false);
+    currentNumbers[randomRow][randomCol] = randomNum;
+
+    delay(delayUpdate);
+
+    updatesCount++;
+  }
+  makeReadyForNext();
+}
+
+
+
+
+void scramble(int row, int col) {
+
+  int scrambleRNG;
+
+  for (int i = 0; i <= numScramble; i++) {
+    do {
+      scrambleRNG = random(10); // This is not TRNG.
+    } while (i > 0 && duplicates[i - 1] == scrambleRNG); // Check for duplicates
+
+    lc.setDigit(row, col, scrambleRNG, false);
+    duplicates[i] = scrambleRNG;
+    delay(delayBetweenScrambles);
+  }
+
+
+  memset(duplicates, 10, numScramble * sizeof(byte));
+
+  // Reset the Duplicates array to all 10s
+  //for (int i = 0; i < numScramble; i++) {
+  //duplicates[i] = 10;
+  //}
+}
+
+void blankAllDigitsNicely() {
+  for (int row = 0; row < ROWS; row++) {
+    if (row % 2 == 1) {
+      // Left to right for even rows
+      for (int col = COLS - 1; col >= 0; col--) {
+        lc.setChar(row, col, ' ', false);
+        currentNumbers[row][col] = 0;
+        delay(15);
+      }
+    } else {
+      // Right to left for odd rows
+      for (int col = 0; col < COLS; col++) {
+        lc.setChar(row, col, ' ', false);
+        currentNumbers[row][col] = 0;
+        delay(15);
+      }
+    }
+  }
+}
+
+void blankAllDigitsFast() {
+  for (int row = 0; row < ROWS; row++) {
+    for (int col = COLS - 1; col >= 0; col--) {
+      lc.setChar(row, col, ' ', false);
+      currentNumbers[row][col] = 0;
+    }
+  }
+}
+
+
+void dimDisplay(byte dim) {
+  for (int i = 0; i < NUM_MAX7219; i++) {
+    lc.setIntensity(i, dim);
+  }
+}
+
+void dimScreenGradually() {
+  for (byte dim = 15; dim > 0; dim--) {
+    dimDisplay(dim);
+    delay(45);
+  }
+}
+
+void makeReadyForNext() {
+  delay(250);
+  dimScreenGradually();
+  blankAllDigitsNicely();
+  dimDisplay(overallBrightness);
+}
+
+void waveEffectFillIn() {
+  // Create an array of row indices
+  int rowIndices[ROWS];
+  for (int i = 0; i < ROWS; i++) {
+    rowIndices[i] = i;
+  }
+
+  // Implement the Fisher-Yates shuffle algorithm to randomly shuffle row indices
+  for (int i = ROWS - 1; i > 0; i--) {
+    int j = trng.getRandomInRange(0, i); // Get a random index
+    // Swap rowIndices[i] and rowIndices[j]
+    int temp = rowIndices[i];
+    rowIndices[i] = rowIndices[j];
+    rowIndices[j] = temp;
+  }
+
+  // Loop over the randomly shuffled row indices
+  for (int i = 0; i < ROWS; i++) {
+    int row = rowIndices[i];  // Get the row index
+
+    // Determine the direction of wave (0 for left-to-right, 1 for right-to-left)
+    int direction = trng.getRandomInRange(0, 1);
+
+    if (direction == 0) {  // left-to-right
+      for (int col = 0; col < COLS; col++) {
+        int randomNumber = trng.getRandomInRange(0, 9);
+        lc.setDigit(row, col, randomNumber, false);
+        delay(100);  // Adjust for the speed of the wave
+      }
+    } else {  // right-to-left
+      for (int col = COLS - 1; col >= 0; col--) {
+        int randomNumber = trng.getRandomInRange(0, 9);
+        lc.setDigit(row, col, randomNumber, false);
+        delay(100);  // Adjust for the speed of the wave
+      }
+    }
+
+    delay(10);  // Adjust for the delay between waves
+  }
+  makeReadyForNext();
+}
+
+
+void scrollEffect(int fallCount, int fallDelay) {
+
+
+  memset(currentNumbers, ' ', sizeof(currentNumbers));
+
+  for (int i = 0; i < fallCount; i++) {
+    char randomNumbers[ROWS]; // Array to hold new random numbers for each row
+
+    // Generate new random numbers for each row
+    for (int row = 0; row < ROWS; row++) {
+      randomNumbers[row] = trng.getRandomInRange(0, 9);
+    }
+    for (int row = 0; row < ROWS; row++) {
+      // Shift all columns to the right
+      for (int col = COLS - 1; col > 0; col--) {
+        currentNumbers[row][col] = currentNumbers[row][col - 1];
+        lc.setDigit(row, col, currentNumbers[row][col], false);
+      }
+      // Set new random number on the left
+      currentNumbers[row][0] = randomNumbers[row];
+      lc.setDigit(row, 0, randomNumbers[row], false);
+    }
+    delay(fallDelay);
+  }
+  makeReadyForNext();
+}
+
+void fillSpiral() {
+
+  // Define the boundaries of the spiral
+  int top = 0;
+  int bottom = ROWS - 1;
+  int left = 0;
+  int right = COLS - 1;
+
+  // Fill the matrix in a spiral pattern
+  while (true) {
+
+    // Check if all rows have been filled
+    if (top > bottom) {
+      break;
+    }
+    // Fill from left to right
+    for (int col = left; col <= right; col++) {
+      int randomNumber = trng.getRandomInRange(0, 9);
+      lc.setDigit(top, col, randomNumber, false);
+      currentNumbers[top][col] = randomNumber;
+      delay(30);
+    }
+    top++;
+
+    // Check if all columns have been filled
+    if (left > right) {
+      break;
+    }
+    // Fill from top to bottom
+    for (int row = top; row <= bottom; row++) {
+      int randomNumber = trng.getRandomInRange(0, 9);
+      lc.setDigit(row, right, randomNumber, false);
+      currentNumbers[row][right] = randomNumber;
+      delay(30);
+    }
+    right--;
+
+    // Check if all rows have been filled
+    if (top > bottom) {
+      break;
+    }
+    // Fill from right to left
+    for (int col = right; col >= left; col--) {
+      int randomNumber = trng.getRandomInRange(0, 9);
+      lc.setDigit(bottom, col, randomNumber, false);
+      currentNumbers[bottom][col] = randomNumber;
+      delay(30);
+    }
+    bottom--;
+
+    // Check if all columns have been filled
+    if (left > right) {
+      break;
+    }
+    // Fill from bottom to top
+    for (int row = bottom; row >= top; row--) {
+      int randomNumber = trng.getRandomInRange(0, 9);
+      lc.setDigit(row, left, randomNumber, false);
+      currentNumbers[row][left] = randomNumber;
+      delay(30);
+    }
+    left++;
+  }
+  makeReadyForNext();
+}
+
+void fillScreenMultipleTimes() {
+  int randomNumbers[ROWS][COLS]; // Array to hold new random numbers for each cell
+
+  // Repeat the fill process 5 times
+  for (int times = 0; times < 5; times++) {
+    // Generate random numbers for all cells
+    for (int row = 0; row < ROWS; row++) {
+      for (int col = 0; col < COLS; col++) {
+        randomNumbers[row][col] = trng.getRandomInRange(0, 9);
+      }
+    }
+
+    // Set random numbers for all cells
+    for (int row = 0; row < ROWS; row++) {
+      for (int col = 0; col < COLS; col++) {
+        lc.setDigit(row, col, randomNumbers[row][col], false);
+        currentNumbers[row][col] = randomNumbers[row][col];
+      }
+    }
+  }
+  makeReadyForNext();
+}
+
+
+void blinkRandomDigits(int blinkCount, int blinkDelay) {
+  for (int i = 0; i < blinkCount; i++) {
+    int randomRow = trng.getRandomInRange(0, ROWS - 1);
+    int randomCol = trng.getRandomInRange(0, COLS - 1);
+    int randomNumber = trng.getRandomInRange(0, 9);
+
+    // Blink on
+    lc.setDigit(randomRow, randomCol, randomNumber, false);
+    delay(blinkDelay);
+
+    // Blink off
+    lc.setChar(randomRow, randomCol, ' ', false);
+    delay(blinkDelay);
+  }
+  blankAllDigitsFast();
+}
+
+void waveEffect() {
+  // Create an array of column indices
+  int colIndices[COLS];
+  for (int i = 0; i < COLS; i++) {
+    colIndices[i] = i;
+  }
+
+  // Implement the Fisher-Yates shuffle algorithm to randomly shuffle column indices
+  for (int i = COLS - 1; i > 0; i--) {
+    int j = trng.getRandomInRange(0, i); // Get a random index
+    // Swap colIndices[i] and colIndices[j]
+    int temp = colIndices[i];
+    colIndices[i] = colIndices[j];
+    colIndices[j] = temp;
+  }
+
+  // Loop over the randomly shuffled column indices
+  for (int i = 0; i < COLS; i++) {
+    int col = colIndices[i];  // Get the column index
+    for (int row = 0; row < ROWS; row++) {
+      int randomNumber = trng.getRandomInRange(0, 9);
+      lc.setDigit(row, col, randomNumber, false);
+      delay(100);  // Adjust for the speed of the wave
+    }
+    delay(10);  // Adjust for the delay between waves
+  }
+  makeReadyForNext();
+}
+
+
+void animateDigit(int row, int col) {
+  // animation sequence A -> B -> C -> D -> E -> F
+  byte sequence[6] = {0b01000000, 0b00100000, 0b00010000, 0b00001000, 0b00000100, 0b00000010};
+
+  for (int i = 0; i < 6; i++) {
+    lc.setRow(row, col, sequence[i]);
+    delay(25); // Delay between each animation
+  }
+}
+
+void animateAllDigitsC() {
+  // animation sequence A -> B -> C -> D -> E -> F
+  byte sequence[6] = {0b01000000, 0b00100000, 0b00010000, 0b00001000, 0b00000100, 0b00000010};
+
+  for (int i = 0; i < 6; i++) {
+    for (int row = 0; row < ROWS; row++) {
+      for (int col = 0; col < COLS; col++) {
+        lc.setRow(row, col, sequence[i]);
+      }
+    }
+    delay(55); // Delay between each animation
+  }
+}
+void animateAllDigitsCC() {
+  // animation sequence A -> B -> C -> D -> E -> F
+  byte sequence[6] = {0b01000000, 0b00000010, 0b00000100, 0b00001000, 0b00010000, 0b00100000 };
+
+  for (int i = 0; i < 6; i++) {
+    for (int row = 0; row < ROWS; row++) {
+      for (int col = 0; col < COLS; col++) {
+        lc.setRow(row, col, sequence[i]);
+      }
+    }
+    delay(55); // Delay between each animation
+  }
+}
+
+void waveAnimation() {
+  // animation sequence A -> B -> C -> D -> E -> F -> G
+  byte sequence[7] = {0b01000000, 0b00100000, 0b00010000, 0b00001000, 0b00000100, 0b00000010, 0b00000001};
+
+  for (int i = 0; i < 7; i++) {
+    for (int row = 0; row < ROWS; row++) {
+      for (int col = 0; col < COLS; col++) {
+        lc.setRow(row, col, sequence[i]);
+      }
+      delay(75); // Delay between each row
+    }
+  }
+}
+
+void numAnimation() {
+  int numAni = trng.getRandomInRange(0, 9);  // get a random number
+
+  // Delay between each step
+  int delayStep = 50;
+
+  for (int row = 0; row < ROWS; row++) {
+    if (row % 2 == 0) { // Move right
+      for (int col = 0; col < COLS; col++) {
+        lc.setDigit(row, col, numAni, false);  // set the digit with the random number
+        delay(1);  // small delay for display update
+        if (col != 0) {
+          lc.setChar(row, col - 1, ' ', false);  // clear the previous digit
+        }
+        delay(delayStep - 1);
+      }
+      // Clear the last digit of the row
+      lc.setChar(row, COLS - 1, ' ', false);
+    } else { // Move left
+      for (int col = COLS - 1; col >= 0; col--) {
+        lc.setDigit(row, col, numAni, false);  // set the digit with the random number
+        delay(1);  // small delay for display update
+        if (col != COLS - 1) {
+          lc.setChar(row, col + 1, ' ', false);  // clear the previous digit
+        }
+        delay(delayStep - 1);
+      }
+      // Clear the first digit of the row
+      lc.setChar(row, 0, ' ', false);
+    }
+  }
+}
+
+void fillAnimation() {
+  int numAni[ROWS][COLS] = {0}; // array to hold the random numbers
+  bool filled[ROWS][COLS] = {false}; // array to track filled spots
+
+  // Delay between each step
+  int delayStep = 10;
+
+  // Number of filled spots
+  int count = 0;
+
+  while (count < ROWS * COLS) {
+    // Generate a new random number
+    int newNum = trng.getRandomInRange(0, 9);
+
+    // For each row
+    for (int row = 0; row < ROWS && count < ROWS * COLS; row++) {
+      if (row % 2 == 0) { // Move right
+        for (int col = 0; col < COLS && count < ROWS * COLS; col++) {
+          // If the spot is not filled
+          if (!filled[row][col]) {
+            numAni[row][col] = newNum; // set the number
+            filled[row][col] = true; // mark the spot as filled
+            count++; // increment the counter
+            break; // break the loop
+          }
+        }
+      } else { // Move left
+        for (int col = COLS - 1; col >= 0 && count < ROWS * COLS; col--) {
+          // If the spot is not filled
+          if (!filled[row][col]) {
+            numAni[row][col] = newNum; // set the number
+            filled[row][col] = true; // mark the spot as filled
+            count++; // increment the counter
+            break; // break the loop
+          }
+        }
+      }
+
+      // Clear the display
+      for (int r = 0; r < ROWS; r++) {
+        for (int c = 0; c < COLS; c++) {
+          lc.setChar(r, c, ' ', false);
+        }
+      }
+      // Display the numbers
+      for (int r = 0; r < ROWS; r++) {
+        for (int c = 0; c < COLS; c++) {
+          if (filled[r][c]) {
+            lc.setDigit(r, c, numAni[r][c], false);
+          }
+        }
+      }
+      delay(delayStep);
+    }
+  }
+  makeReadyForNext();
+}
+
+void fillOneByOne() {
+  // Initialize the 'last' position where we have a non-zero digit
+  int last = 0;
+  // Initialize the 'stuck' position where the next digit will stay
+  int stuck = 47;
+
+  // Initialize the array to -1 (blank).
+  for (int i = 0; i < 48; i++) {
+    display[i] = -1;
+  }
+
+  // Initialize the first number.
+  display[0] = trng.getRandomInRange(0, 9);
+
+  while (stuck >= 0) {
+    // Now display the digits on the 7-segment displays.
+    for (int i = 0; i < 48; i++) {
+      int module = i / 8;  // Each MAX7219 controls 8 digits.
+      int digit = i % 8;
+
+      // Reverse the digit order for odd-numbered modules.
+      if (module % 2 == 1) {
+        digit = 7 - digit;
+      }
+
+      if (display[i] == -1) {
+        lc.setChar(module, digit, ' ', false);
+      } else {
+        lc.setDigit(module, digit, display[i], false);
+      }
+    }
+
+    // Shift current number, if it has not reached its 'stuck' position
+    if (last < stuck) {
+      display[last + 1] = display[last];
+      display[last] = -1;
+      last++;
+    }
+
+    // If current number has reached its 'stuck' position, and there is a still a position left to be filled, generate a new number.
+    if (last == stuck && stuck >= 0) {
+      display[0] = trng.getRandomInRange(0, 9);
+      last = 0;
+      stuck--;
+    }
+
+    // Delay before the next shift.
+    delay(1);
+  }
+  makeReadyForNext();
+}
